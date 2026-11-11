@@ -38,3 +38,11 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:13px 10px
 .pg{display:none}.pg.on{display:block;animation:f .5s}@keyframes f{from{opacity:0;transform:translateY(14px)}}.msg{color:#fb7185;font-size:13px}
 .rv{opacity:0;transform:translateY(30px);transition:opacity .9s,transform .9s}.rv.in{opacity:1;transform:none}
 @media(max-width:860px){.hero,.fg{grid-template-columns:1fr}.vis{display:none}.links{display:none}}
+.material-symbols-rounded{font-family:"Material Symbols Rounded";font-weight:normal;font-style:normal;font-size:1.2em;line-height:1;letter-spacing:normal;text-transform:none;display:inline-block;white-space:nowrap;word-wrap:normal;direction:ltr;font-feature-settings:"liga";-webkit-font-feature-settings:"liga";-webkit-font-smoothing:antialiased;vertical-align:middle}
+.core .material-symbols-rounded{font-size:76px;color:#04201c}
+.ic .material-symbols-rounded{font-size:23px;color:#04201c}
+.gl .material-symbols-rounded{margin-right:5px;color:var(--a)}
+.mq span:before{content:"";display:inline-block;width:7px;height:7px;margin:0 12px 1px 0;border-radius:50%;background:var(--a);box-shadow:0 0 12px rgba(45,212,191,.45);vertical-align:middle}
+.rating-stars{display:inline-flex;gap:2px;color:#fbbf24;vertical-align:middle}
+.rating-stars .material-symbols-rounded{font-size:18px}
+.side .material-symbols-rounded{width:20px;font-size:20px}
