@@ -55,6 +55,7 @@ app.use(session({
 app.use(express.static(path.join(__dirname, 'public')));
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
+const isValidHour = hour => typeof hour === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(hour);
 
 const A = handler => async (req, res) => {
   try {
@@ -134,6 +135,7 @@ app.post('/api/contato', A(async req => {
 app.post('/api/agendar', A(async req => {
   if (!req.session.cli) throw httpError(400, 'Faça login para agendar');
   const { prof_id, modalidade, data, hora } = req.body;
+  if (!isValidHour(hora)) throw httpError(400, 'Horário inválido');
   await pool.query(
     `INSERT INTO agendamentos (cliente_id, prof_id, modalidade, data, hora)
      VALUES ($1, $2, $3, $4, $5)`,
@@ -247,8 +249,10 @@ app.patch('/api/admin/prof/:id', need('prof'), A(req =>
 app.get('/api/admin/horarios', need('horarios'), A(() =>
   rows('SELECT * FROM horarios ORDER BY hora')));
 
-app.post('/api/admin/horarios', need('horarios'), A(req =>
-  pool.query('INSERT INTO horarios (hora) VALUES ($1)', [req.body.hora])));
+app.post('/api/admin/horarios', need('horarios'), A(req => {
+  if (!isValidHour(req.body.hora)) throw httpError(400, 'Horário inválido');
+  return pool.query('INSERT INTO horarios (hora) VALUES ($1)', [req.body.hora]);
+}));
 
 app.delete('/api/admin/horarios/:id', need('horarios'), A(req =>
   pool.query('DELETE FROM horarios WHERE id = $1', [req.params.id])));
