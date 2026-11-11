@@ -1,67 +1,286 @@
-const express=require('express'),session=require('express-session'),bcrypt=require('bcryptjs'),Db=require('better-sqlite3');
-const db=new Db('clinica.db');db.pragma('foreign_keys=ON');
-db.exec(`
-CREATE TABLE IF NOT EXISTS clientes(id INTEGER PRIMARY KEY,nome,email UNIQUE,telefone,senha,criado DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS usuarios_dash(id INTEGER PRIMARY KEY,nome,email UNIQUE,senha,perfil,criado DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS profissionais(id INTEGER PRIMARY KEY,nome,especialidade,ativo INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS horarios(id INTEGER PRIMARY KEY,hora UNIQUE);
-CREATE TABLE IF NOT EXISTS agendamentos(id INTEGER PRIMARY KEY,cliente_id INTEGER REFERENCES clientes(id) ON DELETE CASCADE,prof_id INTEGER REFERENCES profissionais(id),modalidade,data,hora,status DEFAULT 'pendente',criado DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS mensagens(id INTEGER PRIMARY KEY,nome,email,telefone,texto,criado DEFAULT CURRENT_TIMESTAMP);`);
-if(!db.prepare('SELECT 1 FROM usuarios_dash').get()){
- db.prepare('INSERT INTO usuarios_dash(nome,email,senha,perfil) VALUES(?,?,?,?)').run('Administrador','admin@recriarmentes.com.br',bcrypt.hashSync('admin123',10),'admin');
- ['08:00','09:00','10:00','11:00','14:00','15:00','16:00','17:00','18:00'].forEach(h=>db.prepare('INSERT INTO horarios(hora) VALUES(?)').run(h));
- console.log('Admin criado: admin@recriarmentes.com.br / admin123 (TROQUE A SENHA)');}
-// perfis: admin = tudo | gerente = agenda, clientes, profissionais, horarios, mensagens | atendente = agenda, clientes, mensagens
-const PERMS={admin:['*'],gerente:['agenda','clientes','prof','horarios','msgs'],atendente:['agenda','clientes','msgs']};
-const can=(u,p)=>u&&(PERMS[u.perfil].includes('*')||PERMS[u.perfil].includes(p));
-const need=p=>(q,s,n)=>can(q.session.staff,p)?n():s.status(403).json({erro:'Sem permissão'});
-const app=express();app.use(express.json());
-app.use(session({secret:process.env.SECRET||'troque-este-segredo',resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:'lax'}}));
-app.use(express.static('public'));
-const A=(f)=>(q,s)=>{try{s.json(f(q,s)??{ok:1})}catch(e){s.status(400).json({erro:e.message.includes('UNIQUE')?'E-mail já cadastrado':e.message})}};
+require('dotenv').config();
+
+const path = require('node:path');
+const express = require('express');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const { Pool } = require('pg');
+const PgSession = require('connect-pg-simple')(session);
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL não foi configurada');
+}
+
+if (!process.env.SESSION_SECRET) {
+  throw new Error('SESSION_SECRET não foi configurada');
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 1,
+  connectionTimeoutMillis: 10000,
+  enableChannelBinding: true,
+});
+
+pool.on('error', error => console.error('Erro inesperado no pool PostgreSQL:', error));
+
+const PERMS = {
+  admin: ['*'],
+  gerente: ['agenda', 'clientes', 'prof', 'horarios', 'msgs'],
+  atendente: ['agenda', 'clientes', 'msgs'],
+};
+
+const can = (user, permission) =>
+  user && (PERMS[user.perfil]?.includes('*') || PERMS[user.perfil]?.includes(permission));
+
+const need = permission => (req, res, next) =>
+  can(req.session.staff, permission)
+    ? next()
+    : res.status(403).json({ erro: 'Sem permissão' });
+
+const app = express();
+app.set('trust proxy', 1);
+app.use(express.json());
+app.use(session({
+  store: new PgSession({ pool, tableName: 'user_sessions' }),
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+  },
+}));
+app.use(express.static(path.join(__dirname, 'public')));
+
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+
+const A = handler => async (req, res) => {
+  try {
+    const result = await handler(req, res);
+    res.json(result?.command ? { ok: 1 } : result ?? { ok: 1 });
+  } catch (error) {
+    if (error.code === '23505') {
+      const message = error.constraint === 'agendamentos_slot_ativo_idx'
+        ? 'Horário já ocupado'
+        : 'Registro já cadastrado';
+      return res.status(409).json({ erro: message });
+    }
+
+    if (error.status) {
+      return res.status(error.status).json({ erro: error.message });
+    }
+
+    console.error('Erro ao processar requisição:', error);
+    return res.status(500).json({ erro: 'Erro interno do servidor' });
+  }
+};
+
+const rows = async (text, values) => (await pool.query(text, values)).rows;
+const one = async (text, values) => (await pool.query(text, values)).rows[0];
+
 // ---------- público ----------
-app.get('/api/profissionais',A(()=>db.prepare('SELECT id,nome,especialidade FROM profissionais WHERE ativo=1').all()));
-app.get('/api/slots',A(q=>{const{prof,data}=q.query;const u=db.prepare("SELECT hora FROM agendamentos WHERE prof_id=? AND data=? AND status!='cancelado'").all(prof,data).map(x=>x.hora);
- return db.prepare('SELECT hora FROM horarios ORDER BY hora').all().map(x=>x.hora).filter(h=>!u.includes(h))}));
-app.post('/api/register',A((q,s)=>{const{nome,email,telefone,senha}=q.body;if(!nome||!email||!senha||senha.length<6)throw Error('Preencha tudo (senha mín. 6)');
- const r=db.prepare('INSERT INTO clientes(nome,email,telefone,senha) VALUES(?,?,?,?)').run(nome,email.toLowerCase(),telefone,bcrypt.hashSync(senha,10));
- q.session.cli={id:r.lastInsertRowid,nome};return{nome}}));
-app.post('/api/login',A((q)=>{const c=db.prepare('SELECT * FROM clientes WHERE email=?').get((q.body.email||'').toLowerCase());
- if(!c||!bcrypt.compareSync(q.body.senha||'',c.senha))throw Error('E-mail ou senha inválidos');q.session.cli={id:c.id,nome:c.nome};return{nome:c.nome}}));
-app.get('/api/me',A(q=>q.session.cli||{}));
-app.post('/api/logout',A(q=>{q.session.cli=null}));
-app.post('/api/contato',A(q=>{const{nome,email,telefone,texto}=q.body;db.prepare('INSERT INTO mensagens(nome,email,telefone,texto) VALUES(?,?,?,?)').run(nome,email,telefone,texto)}));
-app.post('/api/agendar',A(q=>{if(!q.session.cli)throw Error('Faça login para agendar');const{prof_id,modalidade,data,hora}=q.body;
- if(db.prepare("SELECT 1 FROM agendamentos WHERE prof_id=? AND data=? AND hora=? AND status!='cancelado'").get(prof_id,data,hora))throw Error('Horário já ocupado');
- db.prepare('INSERT INTO agendamentos(cliente_id,prof_id,modalidade,data,hora) VALUES(?,?,?,?,?)').run(q.session.cli.id,prof_id,modalidade,data,hora)}));
-app.get('/api/meus',A(q=>db.prepare('SELECT a.*,p.nome prof FROM agendamentos a JOIN profissionais p ON p.id=prof_id WHERE cliente_id=? ORDER BY data DESC').all(q.session.cli?.id)));
+app.get('/api/profissionais', A(() =>
+  rows('SELECT id, nome, especialidade FROM profissionais WHERE ativo = 1')));
+
+app.get('/api/slots', A(async req => {
+  const { prof, data } = req.query;
+  const ocupados = await rows(
+    "SELECT hora FROM agendamentos WHERE prof_id = $1 AND data = $2 AND status <> 'cancelado'",
+    [prof, data],
+  );
+  const horarios = await rows('SELECT hora FROM horarios ORDER BY hora');
+  const usados = new Set(ocupados.map(row => row.hora));
+  return horarios.map(row => row.hora).filter(hora => !usados.has(hora));
+}));
+
+app.post('/api/register', A(async (req, res) => {
+  const { nome, email, telefone, senha } = req.body;
+  if (!nome || !email || !senha || senha.length < 6) {
+    throw httpError(400, 'Preencha tudo (senha mín. 6)');
+  }
+
+  const cliente = await one(
+    'INSERT INTO clientes (nome, email, telefone, senha) VALUES ($1, $2, $3, $4) RETURNING id, nome',
+    [nome, email.toLowerCase(), telefone, bcrypt.hashSync(senha, 10)],
+  );
+  req.session.cli = { id: cliente.id, nome: cliente.nome };
+  return { nome: cliente.nome };
+}));
+
+app.post('/api/login', A(async req => {
+  const cliente = await one('SELECT * FROM clientes WHERE email = $1', [
+    (req.body.email || '').toLowerCase(),
+  ]);
+  if (!cliente || !bcrypt.compareSync(req.body.senha || '', cliente.senha)) {
+    throw httpError(400, 'E-mail ou senha inválidos');
+  }
+  req.session.cli = { id: cliente.id, nome: cliente.nome };
+  return { nome: cliente.nome };
+}));
+
+app.get('/api/me', A(req => req.session.cli || {}));
+app.post('/api/logout', A(req => { req.session.cli = null; }));
+
+app.post('/api/contato', A(async req => {
+  const { nome, email, telefone, texto } = req.body;
+  await pool.query(
+    'INSERT INTO mensagens (nome, email, telefone, texto) VALUES ($1, $2, $3, $4)',
+    [nome, email, telefone, texto],
+  );
+}));
+
+app.post('/api/agendar', A(async req => {
+  if (!req.session.cli) throw httpError(400, 'Faça login para agendar');
+  const { prof_id, modalidade, data, hora } = req.body;
+  await pool.query(
+    `INSERT INTO agendamentos (cliente_id, prof_id, modalidade, data, hora)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [req.session.cli.id, prof_id, modalidade, data, hora],
+  );
+}));
+
+app.get('/api/meus', A(req => rows(
+  `SELECT a.*, p.nome AS prof
+   FROM agendamentos a
+   JOIN profissionais p ON p.id = a.prof_id
+   WHERE a.cliente_id = $1
+   ORDER BY a.data DESC`,
+  [req.session.cli?.id],
+)));
+
 // ---------- dashboard ----------
-app.post('/api/admin/login',A(q=>{const u=db.prepare('SELECT * FROM usuarios_dash WHERE email=?').get((q.body.email||'').toLowerCase());
- if(!u||!bcrypt.compareSync(q.body.senha||'',u.senha))throw Error('Credenciais inválidas');q.session.staff={id:u.id,nome:u.nome,perfil:u.perfil};return q.session.staff}));
-app.get('/api/admin/me',(q,s)=>q.session.staff?s.json({...q.session.staff,perms:PERMS[q.session.staff.perfil]}):s.status(401).json({}));
-app.post('/api/admin/logout',A(q=>{q.session.staff=null}));
-app.get('/api/admin/stats',need('agenda'),A(()=>({clientes:db.prepare('SELECT COUNT(*) n FROM clientes').get().n,hoje:db.prepare("SELECT COUNT(*) n FROM agendamentos WHERE data=date('now')").get().n,pend:db.prepare("SELECT COUNT(*) n FROM agendamentos WHERE status='pendente'").get().n})));
-app.get('/api/admin/charts',need('agenda'),A(()=>({
- dia:db.prepare("SELECT data d,COUNT(*) n FROM agendamentos WHERE data BETWEEN date('now','-6 days') AND date('now','+7 days') AND status!='cancelado' GROUP BY data").all(),
- status:db.prepare('SELECT status s,COUNT(*) n FROM agendamentos GROUP BY status').all(),
- prof:db.prepare('SELECT p.nome n,COUNT(a.id) c FROM profissionais p LEFT JOIN agendamentos a ON a.prof_id=p.id GROUP BY p.id').all(),
- total:db.prepare('SELECT COUNT(*) n FROM agendamentos').get().n,
- online:db.prepare("SELECT COUNT(*) n FROM agendamentos WHERE modalidade='Online'").get().n,
- prox:db.prepare("SELECT a.data,a.hora,c.nome cliente,p.nome prof,a.status FROM agendamentos a JOIN clientes c ON c.id=cliente_id JOIN profissionais p ON p.id=prof_id WHERE data>=date('now') AND status!='cancelado' ORDER BY data,hora LIMIT 6").all()})));
-app.get('/api/admin/agenda',need('agenda'),A(()=>db.prepare('SELECT a.*,c.nome cliente,c.telefone,p.nome prof FROM agendamentos a JOIN clientes c ON c.id=cliente_id JOIN profissionais p ON p.id=prof_id ORDER BY data DESC,hora').all()));
-app.patch('/api/admin/agenda/:id',need('agenda'),A(q=>db.prepare('UPDATE agendamentos SET status=? WHERE id=?').run(q.body.status,q.params.id)));
-app.get('/api/admin/clientes',need('clientes'),A(()=>db.prepare('SELECT id,nome,email,telefone,criado FROM clientes ORDER BY nome').all()));
-app.delete('/api/admin/clientes/:id',need('clientes'),A(q=>db.prepare('DELETE FROM clientes WHERE id=?').run(q.params.id)));
-app.get('/api/admin/prof',need('prof'),A(()=>db.prepare('SELECT * FROM profissionais').all()));
-app.post('/api/admin/prof',need('prof'),A(q=>db.prepare('INSERT INTO profissionais(nome,especialidade) VALUES(?,?)').run(q.body.nome,q.body.especialidade)));
-app.patch('/api/admin/prof/:id',need('prof'),A(q=>db.prepare('UPDATE profissionais SET ativo=? WHERE id=?').run(q.body.ativo,q.params.id)));
-app.get('/api/admin/horarios',need('horarios'),A(()=>db.prepare('SELECT * FROM horarios ORDER BY hora').all()));
-app.post('/api/admin/horarios',need('horarios'),A(q=>db.prepare('INSERT INTO horarios(hora) VALUES(?)').run(q.body.hora)));
-app.delete('/api/admin/horarios/:id',need('horarios'),A(q=>db.prepare('DELETE FROM horarios WHERE id=?').run(q.params.id)));
-app.get('/api/admin/msgs',need('msgs'),A(()=>db.prepare('SELECT * FROM mensagens ORDER BY id DESC').all()));
+app.post('/api/admin/login', A(async req => {
+  const usuario = await one('SELECT * FROM usuarios_dash WHERE email = $1', [
+    (req.body.email || '').toLowerCase(),
+  ]);
+  if (!usuario || !bcrypt.compareSync(req.body.senha || '', usuario.senha)) {
+    throw httpError(400, 'Credenciais inválidas');
+  }
+  req.session.staff = {
+    id: usuario.id,
+    nome: usuario.nome,
+    perfil: usuario.perfil,
+  };
+  return req.session.staff;
+}));
+
+app.get('/api/admin/me', (req, res) => req.session.staff
+  ? res.json({ ...req.session.staff, perms: PERMS[req.session.staff.perfil] })
+  : res.status(401).json({}));
+
+app.post('/api/admin/logout', A(req => { req.session.staff = null; }));
+
+app.get('/api/admin/stats', need('agenda'), A(async () => {
+  const [clientes, hoje, pend] = await Promise.all([
+    one('SELECT COUNT(*)::int AS n FROM clientes'),
+    one('SELECT COUNT(*)::int AS n FROM agendamentos WHERE data = CURRENT_DATE'),
+    one("SELECT COUNT(*)::int AS n FROM agendamentos WHERE status = 'pendente'"),
+  ]);
+  return { clientes: clientes.n, hoje: hoje.n, pend: pend.n };
+}));
+
+app.get('/api/admin/charts', need('agenda'), A(async () => {
+  const [dia, status, prof, total, online, prox] = await Promise.all([
+    rows(
+      `SELECT data AS d, COUNT(*)::int AS n FROM agendamentos
+       WHERE data BETWEEN CURRENT_DATE - 6 AND CURRENT_DATE + 7
+         AND status <> 'cancelado'
+       GROUP BY data`,
+    ),
+    rows('SELECT status AS s, COUNT(*)::int AS n FROM agendamentos GROUP BY status'),
+    rows(
+      `SELECT p.nome AS n, COUNT(a.id)::int AS c
+       FROM profissionais p LEFT JOIN agendamentos a ON a.prof_id = p.id
+       GROUP BY p.id`,
+    ),
+    one('SELECT COUNT(*)::int AS n FROM agendamentos'),
+    one("SELECT COUNT(*)::int AS n FROM agendamentos WHERE modalidade = 'Online'"),
+    rows(
+      `SELECT a.data, a.hora, c.nome AS cliente, p.nome AS prof, a.status
+       FROM agendamentos a
+       JOIN clientes c ON c.id = a.cliente_id
+       JOIN profissionais p ON p.id = a.prof_id
+       WHERE a.data >= CURRENT_DATE AND a.status <> 'cancelado'
+       ORDER BY a.data, a.hora LIMIT 6`,
+    ),
+  ]);
+  return { dia, status, prof, total: total.n, online: online.n, prox };
+}));
+
+app.get('/api/admin/agenda', need('agenda'), A(() => rows(
+  `SELECT a.*, c.nome AS cliente, c.telefone, p.nome AS prof
+   FROM agendamentos a
+   JOIN clientes c ON c.id = a.cliente_id
+   JOIN profissionais p ON p.id = a.prof_id
+   ORDER BY a.data DESC, a.hora`,
+)));
+
+app.patch('/api/admin/agenda/:id', need('agenda'), A(req =>
+  pool.query('UPDATE agendamentos SET status = $1 WHERE id = $2', [
+    req.body.status,
+    req.params.id,
+  ])));
+
+app.get('/api/admin/clientes', need('clientes'), A(() =>
+  rows('SELECT id, nome, email, telefone, criado FROM clientes ORDER BY nome')));
+
+app.delete('/api/admin/clientes/:id', need('clientes'), A(req =>
+  pool.query('DELETE FROM clientes WHERE id = $1', [req.params.id])));
+
+app.get('/api/admin/prof', need('prof'), A(() =>
+  rows('SELECT * FROM profissionais')));
+
+app.post('/api/admin/prof', need('prof'), A(req =>
+  pool.query(
+    'INSERT INTO profissionais (nome, especialidade) VALUES ($1, $2)',
+    [req.body.nome, req.body.especialidade],
+  )));
+
+app.patch('/api/admin/prof/:id', need('prof'), A(req =>
+  pool.query('UPDATE profissionais SET ativo = $1 WHERE id = $2', [
+    req.body.ativo,
+    req.params.id,
+  ])));
+
+app.get('/api/admin/horarios', need('horarios'), A(() =>
+  rows('SELECT * FROM horarios ORDER BY hora')));
+
+app.post('/api/admin/horarios', need('horarios'), A(req =>
+  pool.query('INSERT INTO horarios (hora) VALUES ($1)', [req.body.hora])));
+
+app.delete('/api/admin/horarios/:id', need('horarios'), A(req =>
+  pool.query('DELETE FROM horarios WHERE id = $1', [req.params.id])));
+
+app.get('/api/admin/msgs', need('msgs'), A(() =>
+  rows('SELECT * FROM mensagens ORDER BY id DESC')));
+
 // só admin gerencia usuários do dashboard
-app.get('/api/admin/usuarios',need('*'),A(()=>db.prepare('SELECT id,nome,email,perfil FROM usuarios_dash').all()));
-app.post('/api/admin/usuarios',need('*'),A(q=>{const{nome,email,senha,perfil}=q.body;if(!PERMS[perfil]||senha?.length<6)throw Error('Dados inválidos');
- db.prepare('INSERT INTO usuarios_dash(nome,email,senha,perfil) VALUES(?,?,?,?)').run(nome,email.toLowerCase(),bcrypt.hashSync(senha,10),perfil)}));
-app.delete('/api/admin/usuarios/:id',need('*'),A(q=>{if(+q.params.id===q.session.staff.id)throw Error('Não pode excluir a si mesmo');db.prepare('DELETE FROM usuarios_dash WHERE id=?').run(q.params.id)}));
-app.listen(3000,()=>console.log('Site: http://localhost:3000  |  Dashboard: http://localhost:3000/admin.html'));
+app.get('/api/admin/usuarios', need('*'), A(() =>
+  rows('SELECT id, nome, email, perfil FROM usuarios_dash')));
+
+app.post('/api/admin/usuarios', need('*'), A(async req => {
+  const { nome, email, senha, perfil } = req.body;
+  if (!PERMS[perfil] || senha?.length < 6) {
+    throw httpError(400, 'Dados inválidos');
+  }
+  await pool.query(
+    'INSERT INTO usuarios_dash (nome, email, senha, perfil) VALUES ($1, $2, $3, $4)',
+    [nome, email.toLowerCase(), bcrypt.hashSync(senha, 10), perfil],
+  );
+}));
+
+app.delete('/api/admin/usuarios/:id', need('*'), A(async req => {
+  if (+req.params.id === req.session.staff.id) {
+    throw httpError(400, 'Não pode excluir a si mesmo');
+  }
+  await pool.query('DELETE FROM usuarios_dash WHERE id = $1', [req.params.id]);
+}));
+
+if (require.main === module) {
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => console.log(`Site: http://localhost:${port}  |  Dashboard: http://localhost:${port}/admin.html`));
+}
+
+module.exports = app;
